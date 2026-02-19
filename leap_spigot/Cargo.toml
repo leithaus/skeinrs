@@ -1,0 +1,38 @@
+[package]
+name = "leap_spigot"
+version = "0.1.0"
+edition = "2021"
+description = """
+LeapMotion gesture controller for dual transcendental spigot streams
+with real-time MIDI generation and ribbon visualizer.
+"""
+
+# ── Runtime dependencies ──────────────────────────────────────────────────────
+[dependencies]
+# Sibling spigot crates
+dual_spigot   = { path = "../dual_spigot"   }
+spigot_stream = { path = "../spigot_stream" }
+spigot_midi   = { path = "../spigot_midi"   }
+
+# Windowed framebuffer — software rendering, no GPU required
+minifb        = "0.27"
+
+# Real-time MIDI output
+midir         = "0.9"
+
+# Cross-platform high-resolution sleep / timing
+# (std::thread::sleep is sufficient; no extra dep needed)
+
+# LeapMotion C SDK safe wrapper — only compiled when the `leap` feature is on.
+# Requires LeapC shared library installed on the system.
+#leaprs        = { version = "0.4", optional = true }
+leaprs        = { version = "0.2.2", optional = true }
+
+# ── Feature flags ─────────────────────────────────────────────────────────────
+[features]
+default = []        # simulation mode (keyboard + mouse) — no hardware needed
+leap    = ["leaprs"] # enable real LeapMotion hardware via LeapC
+
+[[bin]]
+name = "leap_spigot"
+path = "src/main.rs"

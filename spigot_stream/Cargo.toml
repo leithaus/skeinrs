@@ -1,0 +1,21 @@
+[package]
+name = "spigot_stream"
+version = "0.2.0"
+edition = "2021"
+description = "Lazy spigot-algorithm streams for six transcendental constants, with configurable output base"
+
+[dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+
+[lib]
+name = "spigot_stream"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spigot_menu"
+path = "src/main.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"

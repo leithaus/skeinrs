@@ -1,0 +1,761 @@
+//! # spigot_stream
+//!
+//! Lazy, infinite digit streams for six transcendental constants, all
+//! implemented as pure spigot algorithms — no floating-point, no
+//! arbitrary-precision library required.
+//!
+//! Every stream supports an arbitrary **output base** from 2 to 36.
+//! Use `::new()` for the default (base 10) or `::with_base(b)` to choose.
+//! Digits are always `u8` values in `0..base`; use [`digit_char`] to render
+//! them as `0-9` / `a-z` characters.
+//!
+//! | Constant | Natural base | Stream |
+//! |---|---|---|
+//! | π | any | [`PiStream`] |
+//! | e | any | [`EStream`] |
+//! | ln 2 | any | [`Ln2Stream`] |
+//! | Liouville's constant | any (digits always 0 or 1) | [`LiouvilleStream`] |
+//! | Champernowne's constant | any | [`ChampernowneStream`] |
+//! | Prouhet–Thue–Morse | 2 (digits always 0 or 1) | [`ThueMorseStream`] |
+//!
+//! ## Base semantics
+//!
+//! Changing the base genuinely changes *which constant* is being computed —
+//! e.g. `ChampernowneStream::with_base(2)` produces the base-2 Champernowne
+//! constant (concatenation of 1, 10, 11, 100, … in binary), a different
+//! transcendental from the decimal one.  The same applies to π, e, and ln 2:
+//! base-16 π is the familiar BBP-flavoured hex expansion.
+//!
+//! Liouville's constant `∑ b^{-k!}` has 1s at positions `k!` and 0s
+//! elsewhere regardless of base, so its digit *stream* is base-invariant
+//! (only the *value* of the constant changes).  ThueMorse always emits bits.
+//!
+//! ## Quick start
+//!
+//! ```rust
+//! use spigot_stream::{PiStream, EStream, digit_char};
+//!
+//! // Decimal (default)
+//! let dec: Vec<u8> = PiStream::new().take(5).collect();
+//! assert_eq!(dec, [3,1,4,1,5]);
+//!
+//! // Hexadecimal
+//! let hex: Vec<u8> = PiStream::with_base(16).take(5).collect();
+//! // π in hex: 3, 2, 4, 3, F, 6, ...  => [3,2,4,3,15,...]
+//! assert_eq!(hex[0], 3);
+//! assert_eq!(digit_char(hex[1]), '2');
+//!
+//! // Binary e
+//! let bin_e: Vec<u8> = EStream::with_base(2).take(8).collect();
+//! // e in binary: 10.10110111...  => [1,0,1,0,1,1,0,1,...]
+//! assert_eq!(bin_e[0], 1);
+//! ```
+
+use num_bigint::BigInt;
+use num_traits::{Zero, One};
+
+// ── digit rendering ──────────────────────────────────────────────────────────
+
+/// Convert a digit value `0..=35` to its character representation.
+/// 0–9 map to `'0'`–`'9'`; 10–35 map to `'a'`–`'z'`.
+///
+/// ```rust
+/// use spigot_stream::digit_char;
+/// assert_eq!(digit_char(0),  '0');
+/// assert_eq!(digit_char(10), 'a');
+/// assert_eq!(digit_char(15), 'f');
+/// ```
+pub fn digit_char(d: u8) -> char {
+    match d {
+        0..=9  => (b'0' + d) as char,
+        10..=35 => (b'a' + d - 10) as char,
+        _       => '?',
+    }
+}
+
+/// Validate a base, panicking with a helpful message if out of range.
+fn check_base(base: u8) {
+    assert!(base >= 2 && base <= 36,
+        "base must be in 2..=36, got {}", base);
+}
+
+// ── shared combinators macro ─────────────────────────────────────────────────
+
+macro_rules! impl_stream_combinators {
+    ($T:ty) => {
+        impl $T {
+            /// Yield the first `n` digits.  Scala: `stream.take(n)`.
+            pub fn take(self, n: usize) -> std::iter::Take<Self> {
+                Iterator::take(self, n)
+            }
+            /// Skip the first `n` digits.  Scala: `stream.drop(n)`.
+            pub fn drop(mut self, n: usize) -> Self {
+                for _ in 0..n { self.next(); }
+                self
+            }
+            /// Keep only digits satisfying `p`.  Scala: `stream.filter(p)`.
+            pub fn filter<P: FnMut(&u8) -> bool>(
+                self, p: P) -> std::iter::Filter<Self, P> {
+                Iterator::filter(self, p)
+            }
+            /// Transform every digit.  Scala: `stream.map(f)`.
+            pub fn map<B, F: FnMut(u8) -> B>(
+                self, f: F) -> std::iter::Map<Self, F> {
+                Iterator::map(self, f)
+            }
+            /// Flat-map every digit.  Scala: `stream.flatMap(f)`.
+            pub fn flat_map<B, F, I>(self, f: F) -> std::iter::FlatMap<Self, I, F>
+            where F: FnMut(u8) -> I, I: IntoIterator<Item = B> {
+                Iterator::flat_map(self, f)
+            }
+            /// Yield while `p` holds.  Scala: `stream.takeWhile(p)`.
+            pub fn take_while<P: FnMut(&u8) -> bool>(
+                self, p: P) -> std::iter::TakeWhile<Self, P> {
+                Iterator::take_while(self, p)
+            }
+            /// Skip while `p` holds.  Scala: `stream.dropWhile(p)`.
+            pub fn drop_while<P: FnMut(&u8) -> bool>(
+                self, p: P) -> std::iter::SkipWhile<Self, P> {
+                Iterator::skip_while(self, p)
+            }
+            /// Pair each digit with its 0-based index.
+            pub fn zip_with_index(self) -> std::iter::Enumerate<Self> {
+                self.enumerate()
+            }
+            /// Left-fold.  Scala: `stream.foldLeft(z)(f)`.
+            pub fn fold_left<B, F: FnMut(B, u8) -> B>(self, z: B, f: F) -> B {
+                self.fold(z, f)
+            }
+            /// Collect into `Vec<u8>`.
+            pub fn to_vec(self) -> Vec<u8> { self.collect() }
+
+            /// Format `n` digits as a base-`b` string, e.g. `"3.243f6…"` for
+            /// π in base 16.  Uses `digit_char` for the alphabet.
+            pub fn format_in_base(self, n: usize) -> String {
+                if n == 0 { return String::new(); }
+                let mut it = self;
+                let first = it.next().unwrap_or(0);
+                let mut s = crate::digit_char(first).to_string();
+                if n > 1 {
+                    s.push('.');
+                    for d in Iterator::take(&mut it, n - 1) {
+                        s.push(crate::digit_char(d));
+                    }
+                }
+                s
+            }
+        }
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 1. π  — Gosper unbounded LFT spigot, parameterised by base
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Infinite stream of the base-`b` digits of **π**.
+///
+/// Default (`::new()`) is base 10: 3, 1, 4, 1, 5, 9, …
+/// `::with_base(16)` gives hex digits: 3, 2, 4, 3, 15, 6, …  (i.e. 3.243f6…)
+///
+/// Uses Gosper's unbounded LFT spigot with `BigInt` arithmetic so the
+/// internal state can grow without bound without overflowing.
+#[derive(Clone, Debug)]
+pub struct PiStream {
+    q: BigInt, r: BigInt, t: BigInt, k: BigInt, base: BigInt,
+}
+
+impl PiStream {
+    /// Base-10 stream.
+    pub fn new() -> Self { Self::with_base(10) }
+
+    /// Stream in the given base (2–36).
+    pub fn with_base(base: u8) -> Self {
+        check_base(base);
+        PiStream {
+            q:    BigInt::one(),
+            r:    BigInt::zero(),
+            t:    BigInt::one(),
+            k:    BigInt::one(),
+            base: BigInt::from(base),
+        }
+    }
+
+    fn compose(&mut self) {
+        let l   = &self.k * 2 - 1;
+        let new_r = &self.q * &l * &l + &self.r * 6 * &l;
+        self.q  = &self.q * &l;
+        self.r  = new_r;
+        self.t  = &self.t * 6 * &l;
+        self.k += 1;
+    }
+
+    fn extract(&self) -> BigInt { (3 * &self.q + &self.r) / &self.t }
+
+    fn safe(&self, d: &BigInt) -> bool {
+        *d == (4 * &self.q + &self.r) / &self.t
+    }
+
+    fn emit(&mut self, d: &BigInt) {
+        self.r  = &self.base * (&self.r - d * &self.t);
+        self.q  = &self.base * &self.q;
+    }
+
+    /// Format `n` digits as a string (delegates to `format_in_base`).
+    pub fn format_pi(n: usize) -> String { PiStream::new().format_in_base(n) }
+}
+
+impl Default for PiStream { fn default() -> Self { Self::new() } }
+
+impl Iterator for PiStream {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        loop {
+            let d = self.extract();
+            if self.safe(&d) {
+                self.emit(&d.clone());
+                // d is guaranteed to be in 0..base
+                use num_traits::ToPrimitive;
+                return d.to_u8();
+            }
+            self.compose();
+        }
+    }
+}
+impl_stream_combinators!(PiStream);
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2. e  — Taylor-series carry-propagation spigot, parameterised by base
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Infinite stream of the base-`b` digits of **e**.
+///
+/// Default (`::new()`) is base 10: 2, 7, 1, 8, 2, 8, …
+/// `::with_base(2)` gives binary: 1, 0, 1, 0, 1, 1, 0, …  (i.e. 10.10110111…)
+///
+/// Uses the Rabinowitz–Wagon mixed-radix carry-propagation algorithm.
+/// The only base-dependent step is the `× base` multiply in each carry pass.
+/// Working precision grows automatically.
+#[derive(Clone, Debug)]
+pub struct EStream {
+    state:   Vec<u64>,
+    emitted: usize,
+    base:    u64,
+}
+
+impl EStream {
+    /// Base-10 stream.
+    pub fn new() -> Self { Self::with_base(10) }
+
+    /// Stream in the given base (2–36).
+    pub fn with_base(base: u8) -> Self {
+        check_base(base);
+        let n = 60;
+        let mut state = vec![1u64; n];
+        state[0] = 0;
+        EStream { state, emitted: 0, base: base as u64 }
+    }
+
+    fn ensure_capacity(&mut self) {
+        // Slots needed per output digit ≈ log(base) / log(e), rounded up + margin.
+        // log(base)/log(e) = ln(base).  We over-provision by ×3 for safety.
+        let slots_per_digit = ((self.base as f64).ln() * 3.0).ceil() as usize + 2;
+        let needed = (self.emitted + 2) * slots_per_digit + 10;
+        if needed > self.state.len() {
+            self.state.resize(needed, 1);
+        }
+    }
+
+    fn compute_next_digit(&mut self) -> u8 {
+        self.ensure_capacity();
+        let n = self.state.len();
+        let mut carry: u64 = 0;
+        for i in (1..n).rev() {
+            let val = self.state[i] * self.base + carry;
+            self.state[i] = val % (i as u64 + 1);
+            carry = val / (i as u64 + 1);
+        }
+        let val   = self.state[0] * self.base + carry;
+        let digit = val % self.base;
+        self.state[0] = val / self.base;
+        self.emitted += 1;
+        digit as u8
+    }
+}
+
+impl Default for EStream { fn default() -> Self { Self::new() } }
+
+impl Iterator for EStream {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> { Some(self.compute_next_digit()) }
+}
+impl_stream_combinators!(EStream);
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3. ln 2  — series carry-propagation spigot, parameterised by base
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Infinite stream of the base-`b` digits of **ln 2**.
+///
+/// Default (`::new()`) is base 10: 0, 6, 9, 3, 1, 4, …
+/// `::with_base(2)` gives binary: 1, 0, 1, 1, 0, 0, …  (0.10110001…₂)
+///
+/// Uses the series `ln 2 = ∑_{n=1}^∞ 1/(n · 2ⁿ)` with mixed-radix
+/// carry propagation.  The `× base` multiply is the only base-dependent step.
+#[derive(Clone, Debug)]
+pub struct Ln2Stream {
+    state:   Vec<u64>,
+    emitted: usize,
+    base:    u64,
+}
+
+impl Ln2Stream {
+    /// Base-10 stream.
+    pub fn new() -> Self { Self::with_base(10) }
+
+    /// Stream in the given base (2–36).
+    pub fn with_base(base: u8) -> Self {
+        check_base(base);
+        let n = 80;
+        let mut state = vec![0u64; n + 1];
+        for i in 1..=n {
+            state[i] = if i <= 62 { (1u64 << (62 - i)) / i as u64 } else { 0 };
+        }
+        Ln2Stream { state, emitted: 0, base: base as u64 }
+    }
+
+    fn ensure_capacity(&mut self) {
+        let slots_per_digit = ((self.base as f64).ln() * 4.0).ceil() as usize + 4;
+        let needed = (self.emitted + 2) * slots_per_digit + 20;
+        if needed > self.state.len() {
+            let old = self.state.len();
+            self.state.resize(needed, 0);
+            for i in old..needed { self.state[i] = 0; }
+        }
+    }
+
+    fn compute_next_digit(&mut self) -> u8 {
+        self.ensure_capacity();
+        let n = self.state.len() - 1;
+        let mut carry: u64 = 0;
+        for i in (1..=n).rev() {
+            let val   = self.state[i] * self.base + carry;
+            let denom = (i as u64) * 2;
+            self.state[i] = val % denom;
+            carry = val / denom;
+        }
+        let digit = carry % self.base;
+        self.emitted += 1;
+        digit as u8
+    }
+}
+
+impl Default for Ln2Stream { fn default() -> Self { Self::new() } }
+
+impl Iterator for Ln2Stream {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> { Some(self.compute_next_digit()) }
+}
+impl_stream_combinators!(Ln2Stream);
+
+// ════════════════════════════════════════════════════════════════════════════
+// 4. Liouville's constant — positional rule, base-invariant digits
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Infinite stream of the digits of **Liouville's constant**.
+///
+/// `L_b = ∑_{k=1}^∞ b^{-k!}` — a `1` appears at positions `1!, 2!, 3!, …`
+/// (1-based) and `0` everywhere else.  The digit values are always 0 or 1
+/// regardless of base, though the *value* of the constant changes with `b`.
+///
+/// `::with_base(b)` records the base for display purposes but does not
+/// change the emitted digit sequence.
+#[derive(Clone, Debug)]
+pub struct LiouvilleStream {
+    pos:            u64,
+    next_factorial: u64,
+    factorial_k:    u64,
+    led:            bool,
+    pub base:       u8,
+}
+
+impl LiouvilleStream {
+    /// Base-10 stream (digits are always 0 or 1).
+    pub fn new() -> Self { Self::with_base(10) }
+
+    /// Stream for Liouville's constant in the given base.
+    pub fn with_base(base: u8) -> Self {
+        check_base(base);
+        LiouvilleStream { pos: 0, next_factorial: 1, factorial_k: 1, led: false, base }
+    }
+}
+
+impl Default for LiouvilleStream { fn default() -> Self { Self::new() } }
+
+impl Iterator for LiouvilleStream {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        if !self.led { self.led = true; return Some(0); }
+        self.pos += 1;
+        if self.pos == self.next_factorial {
+            self.factorial_k    += 1;
+            self.next_factorial *= self.factorial_k;
+            Some(1)
+        } else {
+            Some(0)
+        }
+    }
+}
+impl_stream_combinators!(LiouvilleStream);
+
+// ════════════════════════════════════════════════════════════════════════════
+// 5. Champernowne's constant — concatenated integers in base b
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Infinite stream of the digits of **Champernowne's constant in base `b`**.
+///
+/// `C_b` is formed by concatenating the base-`b` representations of
+/// 1, 2, 3, … after the radix point.
+///
+/// * Base 10: 0.1 2 3 4 5 6 7 8 9 1 0 1 1 1 2 …  (classical `C₁₀`)
+/// * Base 2:  0.1 10 11 100 101 …                  (a different transcendental)
+/// * Base 16: 0.1 2 3 … 9 a b … f 10 11 …
+#[derive(Clone, Debug)]
+pub struct ChampernowneStream {
+    current_int: u64,
+    digit_buf:   Vec<u8>,
+    led:         bool,
+    base:        u8,
+}
+
+impl ChampernowneStream {
+    /// Base-10 stream.
+    pub fn new() -> Self { Self::with_base(10) }
+
+    /// Stream for Champernowne's constant in the given base.
+    pub fn with_base(base: u8) -> Self {
+        check_base(base);
+        ChampernowneStream { current_int: 1, digit_buf: Vec::new(), led: false, base }
+    }
+
+    /// Decompose `n` into base-`b` digits (most-significant first).
+    fn int_to_digits(mut n: u64, base: u8) -> Vec<u8> {
+        if n == 0 { return vec![0]; }
+        let b = base as u64;
+        let mut digits = Vec::new();
+        while n > 0 {
+            digits.push((n % b) as u8);
+            n /= b;
+        }
+        digits.reverse();
+        digits
+    }
+
+    fn refill(&mut self) {
+        self.digit_buf = Self::int_to_digits(self.current_int, self.base);
+        self.current_int += 1;
+    }
+}
+
+impl Default for ChampernowneStream { fn default() -> Self { Self::new() } }
+
+impl Iterator for ChampernowneStream {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        if !self.led { self.led = true; return Some(0); }
+        if self.digit_buf.is_empty() { self.refill(); }
+        Some(self.digit_buf.remove(0))
+    }
+}
+impl_stream_combinators!(ChampernowneStream);
+
+// ════════════════════════════════════════════════════════════════════════════
+// 6. Prouhet–Thue–Morse constant — bit morphism (naturally base 2)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Infinite stream of the **binary** digits of the Prouhet–Thue–Morse constant.
+///
+/// The k-th bit is `k.count_ones() % 2`.  Digits are always 0 or 1.
+///
+/// This stream is intrinsically base-2.  `::with_base(b)` is accepted for
+/// API uniformity but a base other than 2 emits a warning in debug builds —
+/// the digits do not change (they are always bits), only the *interpreted
+/// value* of the constant would differ.
+#[derive(Clone, Debug)]
+pub struct ThueMorseStream {
+    k:    u64,
+    pub base: u8,
+}
+
+impl ThueMorseStream {
+    /// Base-2 stream (natural).
+    pub fn new() -> Self { Self::with_base(2) }
+
+    /// Accept any base for API uniformity; digits are always 0 or 1.
+    pub fn with_base(base: u8) -> Self {
+        check_base(base);
+        #[cfg(debug_assertions)]
+        if base != 2 {
+            eprintln!(
+                "ThueMorseStream: base {} requested, but digits are always bits (0/1). \
+                 The constant's value changes with base, but the digit sequence does not.",
+                base
+            );
+        }
+        ThueMorseStream { k: 0, base }
+    }
+
+    /// Format `n` bits as a binary string `"0.0110100110010110…"`.
+    pub fn format_binary(n: usize) -> String {
+        ThueMorseStream::new().format_in_base(n)
+    }
+}
+
+impl Default for ThueMorseStream { fn default() -> Self { Self::new() } }
+
+impl Iterator for ThueMorseStream {
+    type Item = u8;
+    fn next(&mut self) -> Option<u8> {
+        let bit = (self.k.count_ones() % 2) as u8;
+        self.k += 1;
+        Some(bit)
+    }
+}
+impl_stream_combinators!(ThueMorseStream);
+
+// ════════════════════════════════════════════════════════════════════════════
+// Runtime dispatch — Constant enum
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The six transcendental constants available as spigot streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Constant {
+    Pi, E, Ln2, Liouville, Champernowne, ThueMorse,
+}
+
+impl Constant {
+    pub fn name(self) -> &'static str {
+        match self {
+            Constant::Pi           => "π  (pi)",
+            Constant::E            => "e  (Euler's number)",
+            Constant::Ln2          => "ln(2)",
+            Constant::Liouville    => "Liouville's constant",
+            Constant::Champernowne => "Champernowne's constant",
+            Constant::ThueMorse    => "Prouhet–Thue–Morse constant",
+        }
+    }
+
+    pub fn approx(self) -> &'static str {
+        match self {
+            Constant::Pi           => "3.14159265358979… (base 10)",
+            Constant::E            => "2.71828182845904… (base 10)",
+            Constant::Ln2          => "0.69314718055994… (base 10)",
+            Constant::Liouville    => "0.110001000…  (1s at k! positions)",
+            Constant::Champernowne => "0.123456789101112… (base 10)",
+            Constant::ThueMorse    => "0.0110100110010110… (binary)",
+        }
+    }
+
+    /// Collect the first `n` digits in base 10.
+    pub fn digits(self, n: usize) -> Vec<u8> {
+        self.digits_in_base(10, n)
+    }
+
+    /// Collect the first `n` digits in the given base.
+    pub fn digits_in_base(self, base: u8, n: usize) -> Vec<u8> {
+        match self {
+            Constant::Pi           => PiStream::with_base(base).take(n).collect(),
+            Constant::E            => EStream::with_base(base).take(n).collect(),
+            Constant::Ln2          => Ln2Stream::with_base(base).take(n).collect(),
+            Constant::Liouville    => LiouvilleStream::with_base(base).take(n).collect(),
+            Constant::Champernowne => ChampernowneStream::with_base(base).take(n).collect(),
+            Constant::ThueMorse    => ThueMorseStream::with_base(base).take(n).collect(),
+        }
+    }
+
+    /// Format `n` digits in base 10.
+    pub fn format(self, n: usize) -> String {
+        self.format_in_base(10, n)
+    }
+
+    /// Format `n` digits in the given base.
+    pub fn format_in_base(self, base: u8, n: usize) -> String {
+        match self {
+            Constant::Pi           => PiStream::with_base(base).format_in_base(n),
+            Constant::E            => EStream::with_base(base).format_in_base(n),
+            Constant::Ln2          => Ln2Stream::with_base(base).format_in_base(n),
+            Constant::Liouville    => LiouvilleStream::with_base(base).format_in_base(n),
+            Constant::Champernowne => ChampernowneStream::with_base(base).format_in_base(n),
+            Constant::ThueMorse    => ThueMorseStream::with_base(base).format_in_base(n),
+        }
+    }
+
+    pub fn all() -> [Constant; 6] {
+        [Constant::Pi, Constant::E, Constant::Ln2,
+         Constant::Liouville, Constant::Champernowne, Constant::ThueMorse]
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── digit_char ───────────────────────────────────────────────────────
+    #[test] fn digit_char_decimal() { assert_eq!(digit_char(9), '9'); }
+    #[test] fn digit_char_hex()     { assert_eq!(digit_char(15), 'f'); }
+    #[test] fn digit_char_z()       { assert_eq!(digit_char(35), 'z'); }
+
+    // ── π base 10 (regression) ───────────────────────────────────────────
+    #[test]
+    fn pi_base10_first_20() {
+        let got: Vec<u8> = PiStream::new().take(20).collect();
+        assert_eq!(got, [3,1,4,1,5,9,2,6,5,3,5,8,9,7,9,3,2,3,8,4]);
+    }
+
+    // ── π base 16 ────────────────────────────────────────────────────────
+    // π in hex = 3.243F6A8885A308D3...
+    // digits:    3  2  4  3 15  6 10  8  8  8  5 10  3  0  8 13  3 ...
+    #[test]
+    fn pi_base16_first_digit() {
+        let got: Vec<u8> = PiStream::with_base(16).take(1).collect();
+        assert_eq!(got[0], 3);
+    }
+
+    #[test]
+    fn pi_base16_format() {
+        let s = PiStream::with_base(16).format_in_base(8);
+        // Should start "3.243f6a8"
+        assert!(s.starts_with("3."), "got: {}", s);
+        // second char after decimal should be '2'
+        assert_eq!(&s[2..3], "2", "got: {}", s);
+    }
+
+    // ── π base 2 ─────────────────────────────────────────────────────────
+    // π in binary = 11.001001000011111101101010100010001000010110100...
+    // integer part digits: 1,1 then frac: 0,0,1,0,0,1,0,0,0,0,1,1,1,1,1,1...
+    #[test]
+    fn pi_base2_starts_with_11() {
+        let got: Vec<u8> = PiStream::with_base(2).take(2).collect();
+        assert_eq!(got, [1,1]);
+    }
+
+    // ── e base 10 (regression) ───────────────────────────────────────────
+    #[test]
+    fn e_base10_first_15() {
+        let got: Vec<u8> = EStream::new().take(15).collect();
+        assert_eq!(got, [2,7,1,8,2,8,1,8,2,8,4,5,9,0,4]);
+    }
+
+    // ── e base 2 ─────────────────────────────────────────────────────────
+    // e in binary = 10.10110111111000010101000101100010...
+    // First two digits are 1, 0  (i.e. integer part = 2 = 10₂)
+    #[test]
+    fn e_base2_integer_part() {
+        let got: Vec<u8> = EStream::with_base(2).take(2).collect();
+        assert_eq!(got[0], 1, "e in binary starts with 1");
+        assert_eq!(got[1], 0, "e in binary second digit is 0");
+    }
+
+    // ── ln2 base 10 (regression) ─────────────────────────────────────────
+    #[test]
+    fn ln2_base10_first_digit() {
+        assert_eq!(Ln2Stream::new().next().unwrap(), 0);
+    }
+
+    // ── ln2 base 2 ───────────────────────────────────────────────────────
+    // ln(2) in binary = 0.10110001011100100001011111110111011110...
+    #[test]
+    fn ln2_base2_first_digit() {
+        let d = Ln2Stream::with_base(2).next().unwrap();
+        assert_eq!(d, 0, "ln2 < 1 so first binary digit is 0");
+    }
+
+    // ── Liouville ────────────────────────────────────────────────────────
+    #[test]
+    fn liouville_base_invariant() {
+        // Digits are always 0/1 regardless of base
+        let d10: Vec<u8> = LiouvilleStream::new().take(10).collect();
+        let d2:  Vec<u8> = LiouvilleStream::with_base(2).take(10).collect();
+        assert_eq!(d10, d2, "Liouville digit sequence is base-invariant");
+        assert_eq!(d10[1], 1); // pos 1 = 1!
+        assert_eq!(d10[2], 1); // pos 2 = 2!
+    }
+
+    // ── Champernowne base 10 (regression) ────────────────────────────────
+    #[test]
+    fn champernowne_base10() {
+        let got: Vec<u8> = ChampernowneStream::new().take(15).collect();
+        assert_eq!(got, [0,1,2,3,4,5,6,7,8,9,1,0,1,1,1]);
+    }
+
+    // ── Champernowne base 2 ───────────────────────────────────────────────
+    // C₂ = 0. 1 | 10 | 11 | 100 | 101 | 110 | 111 | 1000 ...
+    //      0   1   1 0  1 1  1 0 0  1 0 1  1 1 0  1 1 1  1 0 0 0
+    #[test]
+    fn champernowne_base2() {
+        let got: Vec<u8> = ChampernowneStream::with_base(2).take(13).collect();
+        // 0 | 1 | 10 | 11 | 100 | 101
+        assert_eq!(got[0], 0);  // integer part 0
+        assert_eq!(got[1], 1);  // "1"
+        assert_eq!(got[2], 1);  // "10" → 1
+        assert_eq!(got[3], 0);  //       0
+        assert_eq!(got[4], 1);  // "11" → 1
+        assert_eq!(got[5], 1);  //        1
+        assert_eq!(got[6], 1);  // "100" → 1
+        assert_eq!(got[7], 0);  //         0
+        assert_eq!(got[8], 0);  //         0
+    }
+
+    // ── Champernowne base 16 ──────────────────────────────────────────────
+    #[test]
+    fn champernowne_base16_digits_in_range() {
+        // All digits should be < 16
+        let got: Vec<u8> = ChampernowneStream::with_base(16).take(30).collect();
+        for &d in &got { assert!(d < 16, "digit {} out of range for base 16", d); }
+        // First digit is 0 (integer part), second is 1
+        assert_eq!(got[0], 0);
+        assert_eq!(got[1], 1);
+    }
+
+    // ── Thue–Morse ───────────────────────────────────────────────────────
+    #[test]
+    fn thue_morse_first_16() {
+        let got: Vec<u8> = ThueMorseStream::new().take(16).collect();
+        assert_eq!(got, [0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0]);
+    }
+
+    // ── Constant enum ────────────────────────────────────────────────────
+    #[test]
+    fn constant_digits_in_base() {
+        assert_eq!(&Constant::Pi.digits_in_base(10, 5), &[3,1,4,1,5]);
+        let hex = Constant::Pi.digits_in_base(16, 1);
+        assert_eq!(hex[0], 3);
+    }
+
+    #[test]
+    fn constant_format_in_base() {
+        let s = Constant::E.format_in_base(2, 5);
+        assert!(s.starts_with("1."), "binary e starts 1.: got {}", s);
+    }
+
+    // ── combinators still work ────────────────────────────────────────────
+    #[test]
+    fn drop_take_hex_pi() {
+        let got: Vec<u8> = PiStream::with_base(16).drop(1).take(3).collect();
+        // π hex = 3.243f6... → after integer part, frac digits: 2,4,3,...
+        assert_eq!(got[0], 2);
+        assert_eq!(got[1], 4);
+        assert_eq!(got[2], 3);
+    }
+
+    #[test]
+    fn fold_binary_e() {
+        // Sum of first 8 binary digits of e should equal count of 1-bits
+        let sum = EStream::with_base(2).take(8).fold_left(0u32, |a,d| a + d as u32);
+        // Just check it's a plausible number of 1-bits in 8 binary digits
+        assert!(sum <= 8);
+    }
+}

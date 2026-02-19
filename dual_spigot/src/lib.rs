@@ -1,0 +1,472 @@
+//! # dual_spigot
+//!
+//! A paired, independently-advanceable Scala-style stream over two
+//! transcendental spigot streams (Left and Right), now with configurable
+//! output base per side.
+//!
+//! Each side carries its own [`Constant`] *and* its own base, so you can
+//! zip, say, π in base 16 against e in base 2.
+//!
+//! See [`DualStream`] for the full API.
+
+use std::collections::HashMap;
+use spigot_stream::{
+    Constant,
+    PiStream, EStream, Ln2Stream,
+    LiouvilleStream, ChampernowneStream, ThueMorseStream,
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// SpigotConfig — constant + base pair
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A (constant, base) pair that fully specifies one side of a [`DualStream`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpigotConfig {
+    pub constant: Constant,
+    pub base:     u8,
+}
+
+impl SpigotConfig {
+    pub fn new(constant: Constant, base: u8) -> Self {
+        assert!(base >= 2 && base <= 36, "base must be 2–36, got {}", base);
+        SpigotConfig { constant, base }
+    }
+
+    /// Shorthand: decimal (base 10) for this constant.
+    pub fn decimal(constant: Constant) -> Self { Self::new(constant, 10) }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// BoxedSpigot — type-erased cursor with (Constant, base, position)
+// ════════════════════════════════════════════════════════════════════════════
+
+pub struct BoxedSpigot {
+    inner:    Box<dyn Iterator<Item = u8> + Send>,
+    pub config:   SpigotConfig,
+    pub position: usize,
+}
+
+impl BoxedSpigot {
+    fn from_config(cfg: SpigotConfig) -> Self {
+        let inner: Box<dyn Iterator<Item = u8> + Send> = match cfg.constant {
+            Constant::Pi           => Box::new(PiStream::with_base(cfg.base)),
+            Constant::E            => Box::new(EStream::with_base(cfg.base)),
+            Constant::Ln2          => Box::new(Ln2Stream::with_base(cfg.base)),
+            Constant::Liouville    => Box::new(LiouvilleStream::with_base(cfg.base)),
+            Constant::Champernowne => Box::new(ChampernowneStream::with_base(cfg.base)),
+            Constant::ThueMorse    => Box::new(ThueMorseStream::with_base(cfg.base)),
+        };
+        BoxedSpigot { inner, config: cfg, position: 0 }
+    }
+
+    pub fn next_digit(&mut self) -> Option<u8> {
+        let d = self.inner.next();
+        if d.is_some() { self.position += 1; }
+        d
+    }
+
+    pub fn advance(&mut self, n: usize) {
+        for _ in 0..n { self.next_digit(); }
+    }
+
+    pub fn take_n(&mut self, n: usize) -> Vec<u8> {
+        (0..n).filter_map(|_| self.next_digit()).collect()
+    }
+
+    pub fn advance_while<P: FnMut(u8) -> bool>(&mut self, mut pred: P) -> Option<u8> {
+        loop {
+            match self.next_digit() {
+                None    => return None,
+                Some(d) => if !pred(d) { return Some(d); }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BoxedSpigot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BoxedSpigot {{ {:?} base {} @ pos {} }}",
+               self.config.constant, self.config.base, self.position)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SideCursor
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A short-lived mutable handle to one side of a [`DualStream`].
+pub struct SideCursor<'a> {
+    spigot: &'a mut BoxedSpigot,
+}
+
+impl<'a> SideCursor<'a> {
+    fn new(spigot: &'a mut BoxedSpigot) -> Self { SideCursor { spigot } }
+
+    pub fn constant(&self) -> Constant { self.spigot.config.constant }
+    pub fn base(&self)     -> u8       { self.spigot.config.base }
+    pub fn position(&self) -> usize    { self.spigot.position }
+
+    /// Skip `n` digits.
+    pub fn drop(&mut self, n: usize) -> &mut Self {
+        self.spigot.advance(n); self
+    }
+    /// Consume and return the next `n` digits.
+    pub fn take(&mut self, n: usize) -> Vec<u8> {
+        self.spigot.take_n(n)
+    }
+    /// Consume one digit.
+    pub fn next(&mut self) -> Option<u8> {
+        self.spigot.next_digit()
+    }
+    /// Skip while `pred` holds; return first failing digit (consumed).
+    pub fn drop_while<P: FnMut(u8) -> bool>(&mut self, pred: P) -> Option<u8> {
+        self.spigot.advance_while(pred)
+    }
+    /// Collect while `pred` holds; stopping digit is consumed but not returned.
+    pub fn take_while<P: FnMut(u8) -> bool>(&mut self, mut pred: P) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            match self.spigot.next_digit() {
+                None    => break,
+                Some(d) => { if pred(d) { out.push(d); } else { break; } }
+            }
+        }
+        out
+    }
+    /// Consume `n` digits, return those satisfying `pred`.
+    pub fn filter_n<P: FnMut(u8) -> bool>(&mut self, n: usize, mut pred: P) -> Vec<u8> {
+        (0..n).filter_map(|_| self.spigot.next_digit())
+              .filter(|d| pred(*d)).collect()
+    }
+    /// Map `f` over the next `n` digits.
+    pub fn map_n<B, F: FnMut(u8) -> B>(&mut self, n: usize, f: F) -> Vec<B> {
+        self.take(n).into_iter().map(f).collect()
+    }
+    /// Fold the next `n` digits.
+    pub fn fold_n<B, F: FnMut(B, u8) -> B>(&mut self, n: usize, init: B, f: F) -> B {
+        self.take(n).into_iter().fold(init, f)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ZipIter
+// ════════════════════════════════════════════════════════════════════════════
+
+pub struct ZipIter<'a> {
+    left:  &'a mut BoxedSpigot,
+    right: &'a mut BoxedSpigot,
+}
+
+impl<'a> Iterator for ZipIter<'a> {
+    type Item = (u8, u8);
+    fn next(&mut self) -> Option<(u8, u8)> {
+        match (self.left.next_digit(), self.right.next_digit()) {
+            (Some(l), Some(r)) => Some((l, r)),
+            _ => None,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DualStream
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A paired, independently-advanceable stream over two transcendental spigots.
+///
+/// Each side has its own [`Constant`] and output **base** (2–36).
+///
+/// # Construction
+///
+/// ```rust
+/// use dual_spigot::{DualStream, SpigotConfig};
+/// use spigot_stream::Constant;
+///
+/// // Both sides in base 10 (convenience constructor)
+/// let ds = DualStream::new(Constant::Pi, Constant::E);
+///
+/// // Different bases per side
+/// let ds = DualStream::from_configs(
+///     SpigotConfig::new(Constant::Pi,  16),   // π in hex
+///     SpigotConfig::new(Constant::E,    2),   // e in binary
+/// );
+/// ```
+pub struct DualStream {
+    left:     BoxedSpigot,
+    right:    BoxedSpigot,
+    snippets: HashMap<String, Vec<(u8, u8)>>,
+}
+
+impl DualStream {
+    /// Both sides in base 10.
+    pub fn new(left: Constant, right: Constant) -> Self {
+        Self::from_configs(SpigotConfig::decimal(left), SpigotConfig::decimal(right))
+    }
+
+    /// Full constructor — specify constant and base independently per side.
+    pub fn from_configs(left: SpigotConfig, right: SpigotConfig) -> Self {
+        DualStream {
+            left:     BoxedSpigot::from_config(left),
+            right:    BoxedSpigot::from_config(right),
+            snippets: HashMap::new(),
+        }
+    }
+
+    // ── side access ──────────────────────────────────────────────────────
+
+    pub fn left(&mut self)  -> SideCursor<'_> { SideCursor::new(&mut self.left)  }
+    pub fn right(&mut self) -> SideCursor<'_> { SideCursor::new(&mut self.right) }
+
+    pub fn left_pos(&self)      -> usize    { self.left.position }
+    pub fn right_pos(&self)     -> usize    { self.right.position }
+    pub fn left_constant(&self) -> Constant { self.left.config.constant }
+    pub fn right_constant(&self)-> Constant { self.right.config.constant }
+    pub fn left_base(&self)     -> u8       { self.left.config.base }
+    pub fn right_base(&self)    -> u8       { self.right.config.base }
+    pub fn left_config(&self)   -> SpigotConfig { self.left.config }
+    pub fn right_config(&self)  -> SpigotConfig { self.right.config }
+
+    // ── zip operations ───────────────────────────────────────────────────
+
+    pub fn zip_next(&mut self) -> Option<(u8, u8)> {
+        match (self.left.next_digit(), self.right.next_digit()) {
+            (Some(l), Some(r)) => Some((l, r)),
+            _ => None,
+        }
+    }
+
+    pub fn zip_take(&mut self, n: usize) -> Vec<(u8, u8)> {
+        (0..n).filter_map(|_| self.zip_next()).collect()
+    }
+
+    pub fn zip_iter(&mut self) -> ZipIter<'_> {
+        ZipIter { left: &mut self.left, right: &mut self.right }
+    }
+
+    pub fn zip_drop(&mut self, n: usize) {
+        self.left.advance(n);
+        self.right.advance(n);
+    }
+
+    pub fn zip_filter_n<P: FnMut(&(u8,u8)) -> bool>(&mut self, n: usize, mut pred: P)
+        -> Vec<(u8, u8)>
+    {
+        self.zip_take(n).into_iter().filter(|p| pred(p)).collect()
+    }
+
+    pub fn zip_map_n<B, F: FnMut((u8,u8)) -> B>(&mut self, n: usize, f: F) -> Vec<B> {
+        self.zip_take(n).into_iter().map(f).collect()
+    }
+
+    pub fn zip_fold_n<B, F: FnMut(B,(u8,u8)) -> B>(&mut self, n: usize, init: B, f: F) -> B {
+        self.zip_take(n).into_iter().fold(init, f)
+    }
+
+    // ── twist ─────────────────────────────────────────────────────────────
+
+    /// Swap Left and Right cursors (constant, base, and position all swap).
+    pub fn twist(&mut self) {
+        std::mem::swap(&mut self.left, &mut self.right);
+    }
+
+    // ── snip ──────────────────────────────────────────────────────────────
+
+    /// Copy zipped pairs at absolute positions `from..to` into a named snippet.
+    ///
+    /// Fresh spigots are created (using each side's current config), fast-
+    /// forwarded to `from`, and `to−from` pairs are collected.  The live
+    /// cursors are **not** affected.
+    pub fn snip(&mut self, key: &str, from: usize, to: usize) {
+        assert!(from <= to, "snip: from ({}) must be <= to ({})", from, to);
+        let mut sl = BoxedSpigot::from_config(self.left.config);
+        let mut sr = BoxedSpigot::from_config(self.right.config);
+        sl.advance(from);
+        sr.advance(from);
+        let pairs: Vec<(u8, u8)> = (from..to)
+            .filter_map(|_| match (sl.next_digit(), sr.next_digit()) {
+                (Some(l), Some(r)) => Some((l, r)),
+                _ => None,
+            })
+            .collect();
+        self.snippets.insert(key.to_string(), pairs);
+    }
+
+    pub fn get_snippet(&self, key: &str)        -> Option<&Vec<(u8,u8)>> { self.snippets.get(key) }
+    pub fn remove_snippet(&mut self, key: &str) -> Option<Vec<(u8,u8)>> { self.snippets.remove(key) }
+    pub fn snippet_keys(&self) -> Vec<&str> {
+        let mut k: Vec<&str> = self.snippets.keys().map(|s| s.as_str()).collect();
+        k.sort(); k
+    }
+    pub fn snippet_count(&self) -> usize { self.snippets.len() }
+
+    // ── display ───────────────────────────────────────────────────────────
+
+    pub fn status(&self) -> String {
+        format!(
+            "DualStream {{ left: {} (base {}) @ {}, right: {} (base {}) @ {}, snippets: {} }}",
+            self.left.config.constant.name(),  self.left.config.base,  self.left.position,
+            self.right.config.constant.name(), self.right.config.base, self.right.position,
+            self.snippets.len(),
+        )
+    }
+}
+
+impl std::fmt::Debug for DualStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.status())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── basic base-10 zip (regression) ───────────────────────────────────
+    #[test]
+    fn zip_first_pair_pi_e_base10() {
+        let mut ds = DualStream::new(Constant::Pi, Constant::E);
+        assert_eq!(ds.zip_next().unwrap(), (3, 2));
+    }
+
+    // ── mixed-base construction ───────────────────────────────────────────
+    #[test]
+    fn from_configs_stores_base() {
+        let ds = DualStream::from_configs(
+            SpigotConfig::new(Constant::Pi, 16),
+            SpigotConfig::new(Constant::E,   2),
+        );
+        assert_eq!(ds.left_base(),  16);
+        assert_eq!(ds.right_base(),  2);
+        assert_eq!(ds.left_constant(),  Constant::Pi);
+        assert_eq!(ds.right_constant(), Constant::E);
+    }
+
+    #[test]
+    fn zip_pi_hex_e_bin_first_digit() {
+        let mut ds = DualStream::from_configs(
+            SpigotConfig::new(Constant::Pi, 16),
+            SpigotConfig::new(Constant::E,   2),
+        );
+        let (l, r) = ds.zip_next().unwrap();
+        assert_eq!(l, 3, "π hex integer part = 3");
+        assert_eq!(r, 1, "e binary integer part = 1");
+    }
+
+    // ── independent side advancement ─────────────────────────────────────
+    #[test]
+    fn left_drop_shifts_zip() {
+        let mut ds = DualStream::new(Constant::Pi, Constant::E);
+        ds.left().drop(10);
+        let p = ds.zip_next().unwrap();
+        assert_eq!(p.1, 2, "Right still at e[0]=2");
+        assert_eq!(p.0, 5, "Left at π[10]=5");
+    }
+
+    #[test]
+    fn right_drop_does_not_move_left() {
+        let mut ds = DualStream::new(Constant::Pi, Constant::E);
+        ds.right().drop(5);
+        assert_eq!(ds.left_pos(), 0);
+        assert_eq!(ds.right_pos(), 5);
+    }
+
+    // ── base threaded through left/right ops ─────────────────────────────
+    #[test]
+    fn left_take_respects_base() {
+        let mut ds = DualStream::from_configs(
+            SpigotConfig::new(Constant::Pi, 16),
+            SpigotConfig::new(Constant::E,  10),
+        );
+        let digits = ds.left().take(3);
+        // π in hex: first 3 digits are 3, 2, 4
+        assert_eq!(digits[0], 3);
+        assert_eq!(digits[1], 2);
+        assert_eq!(digits[2], 4);
+    }
+
+    // ── twist ─────────────────────────────────────────────────────────────
+    #[test]
+    fn twist_swaps_config_and_position() {
+        let mut ds = DualStream::from_configs(
+            SpigotConfig::new(Constant::Pi, 16),
+            SpigotConfig::new(Constant::E,   2),
+        );
+        ds.left().drop(4);
+        assert_eq!(ds.left_pos(), 4);
+        assert_eq!(ds.right_pos(), 0);
+
+        ds.twist();
+
+        assert_eq!(ds.left_constant(),  Constant::E);
+        assert_eq!(ds.left_base(),       2);
+        assert_eq!(ds.left_pos(),        0);
+        assert_eq!(ds.right_constant(), Constant::Pi);
+        assert_eq!(ds.right_base(),     16);
+        assert_eq!(ds.right_pos(),       4);
+    }
+
+    #[test]
+    fn double_twist_identity() {
+        let mut ds = DualStream::from_configs(
+            SpigotConfig::new(Constant::Pi, 16),
+            SpigotConfig::new(Constant::E,   2),
+        );
+        ds.left().drop(7);
+        let lpos = ds.left_pos();
+        ds.twist(); ds.twist();
+        assert_eq!(ds.left_pos(),       lpos);
+        assert_eq!(ds.left_constant(),  Constant::Pi);
+        assert_eq!(ds.left_base(),      16);
+        assert_eq!(ds.right_constant(), Constant::E);
+        assert_eq!(ds.right_base(),      2);
+    }
+
+    // ── snip uses each side's config ─────────────────────────────────────
+    #[test]
+    fn snip_uses_config_base() {
+        let mut ds = DualStream::from_configs(
+            SpigotConfig::new(Constant::Pi, 16),
+            SpigotConfig::new(Constant::E,  10),
+        );
+        ds.snip("s", 0, 3);
+        let s = ds.get_snippet("s").unwrap();
+        // left = π hex[0..3] = [3,2,4], right = e dec[0..3] = [2,7,1]
+        assert_eq!(s[0], (3, 2));
+        assert_eq!(s[1], (2, 7));
+        assert_eq!(s[2], (4, 1));
+    }
+
+    #[test]
+    fn snip_does_not_move_cursors() {
+        let mut ds = DualStream::new(Constant::Pi, Constant::E);
+        ds.left().drop(5);
+        let lpos = ds.left_pos();
+        ds.snip("x", 10, 20);
+        assert_eq!(ds.left_pos(),  lpos);
+        assert_eq!(ds.right_pos(), 0);
+    }
+
+    // ── zip combinators ───────────────────────────────────────────────────
+    #[test]
+    fn zip_fold_sum_base10() {
+        let mut ds = DualStream::new(Constant::Pi, Constant::E);
+        // π[0..5]=[3,1,4,1,5]=14  e[0..5]=[2,7,1,8,2]=20  total=34
+        let s = ds.zip_fold_n(5, 0u32, |a,(l,r)| a + l as u32 + r as u32);
+        assert_eq!(s, 34);
+    }
+
+    #[test]
+    fn zip_filter_n_mixed_base() {
+        let mut ds = DualStream::from_configs(
+            SpigotConfig::new(Constant::Pi, 16),
+            SpigotConfig::new(Constant::E,  16),
+        );
+        // Filter pairs where left digit < 4 in the first 8 pairs
+        let filtered = ds.zip_filter_n(8, |(l, _)| *l < 4);
+        for (l, _) in &filtered { assert!(*l < 4); }
+    }
+}

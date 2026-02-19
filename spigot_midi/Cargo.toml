@@ -1,0 +1,17 @@
+[package]
+name = "spigot_midi"
+version = "0.1.0"
+edition = "2021"
+description = "Generate MIDI files from dual transcendental spigot streams"
+
+[dependencies]
+dual_spigot   = { path = "../dual_spigot" }
+spigot_stream = { path = "../spigot_stream" }
+
+[[bin]]
+name = "spigot_midi"
+path = "src/main.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"

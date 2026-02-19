@@ -1,0 +1,16 @@
+[package]
+name = "dual_spigot"
+version = "0.1.0"
+edition = "2021"
+description = "Paired, independently-advanceable spigot streams with zip, snip, and twist"
+
+[dependencies]
+spigot_stream = { path = "../spigot_stream" }
+
+[[bin]]
+name = "dual_menu"
+path = "src/main.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
