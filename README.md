@@ -19,3 +19,9 @@ Or without
 to configure everything interactively first:
 bashcargo run
 It will ask you to pick constants, bases, scale, instrument, tempo, then open the visualizer window.
+
+If you have a LeapMotion controller set up then
+
+```
+cargo build --features leap
+```
