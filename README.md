@@ -7,7 +7,13 @@ cd leap_spigot
 cargo build
 ```
 
-then
+Or, if you have a LeapMotion controller set up, then build with
+
+```
+cargo build --features leap
+```
+
+Then to run the application.
 
 ```
 cargo run -- --quick
@@ -20,8 +26,3 @@ to configure everything interactively first:
 bashcargo run
 It will ask you to pick constants, bases, scale, instrument, tempo, then open the visualizer window.
 
-If you have a LeapMotion controller set up then
-
-```
-cargo build --features leap
-```
