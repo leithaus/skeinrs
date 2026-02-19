@@ -7,6 +7,8 @@ cd leap_spigot
 cargo build
 ```
 
+then
+
 ```
 cargo run -- --quick
 ```
