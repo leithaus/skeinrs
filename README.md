@@ -13,7 +13,7 @@ Or, if you have a LeapMotion controller set up, then build with
 cargo build --features leap
 ```
 
-Then to run the application.
+Then to run the application:
 
 ```
 cargo run -- --quick
