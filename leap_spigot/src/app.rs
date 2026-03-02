@@ -295,13 +295,13 @@ impl AppState {
 /// This is the entry point called from `main.rs`.  It creates the visualizer,
 /// the gesture source (simulation by default, hardware with `--feature leap`),
 /// and drives the event/render loop at ~60 fps.
-pub fn run(cfg: AppConfig) -> Result<(), String> {
+pub fn run(cfg: AppConfig, layout: crate::visualizer::LayoutMode) -> Result<(), String> {
     // ── Sim gesture channel ───────────────────────────────────────────────
     let (sim_tx, sim_rx) = mpsc::channel::<SimInput>();
     let gesture_rx = spawn_gesture_source(SimGestureSource { rx: sim_rx });
 
     // ── Visualizer (owns the window and the sim input sender) ────────────
-    let mut vis = Visualizer::new(sim_tx)?;
+    let mut vis = Visualizer::new(sim_tx, layout)?;
 
     // ── App state ─────────────────────────────────────────────────────────
     let mut app = AppState::new(cfg);
@@ -321,7 +321,6 @@ pub fn run(cfg: AppConfig) -> Result<(), String> {
             match gesture_rx.try_recv() {
                 Ok(GestureEvent::Quit) => return Ok(()),
                 Ok(GestureEvent::Scissors { name }) => {
-                    // Name already collected (hw mode) or we need to prompt (sim mode)
                     let n = if name.is_empty() {
                         print!("  Snippet name: ");
                         io::stdout().flush().ok();
@@ -331,9 +330,22 @@ pub fn run(cfg: AppConfig) -> Result<(), String> {
                     } else {
                         name
                     };
+                    vis.notify_gesture(crate::visualizer::HandGesture::Scissors);
                     app.handle_gesture(GestureEvent::Scissors { name: n });
                 }
-                Ok(evt) => app.handle_gesture(evt),
+                Ok(ref evt) => {
+                    // Map gesture to hand pose for 3D ghost
+                    let hg = match evt {
+                        GestureEvent::PullLeft  { .. } => crate::visualizer::HandGesture::PullLeft,
+                        GestureEvent::PullRight { .. } => crate::visualizer::HandGesture::PullRight,
+                        GestureEvent::Twist            => crate::visualizer::HandGesture::Twist,
+                        GestureEvent::Clap             => crate::visualizer::HandGesture::Clap,
+                        GestureEvent::Unclap           => crate::visualizer::HandGesture::Idle,
+                        _                              => crate::visualizer::HandGesture::Idle,
+                    };
+                    vis.notify_gesture(hg);
+                    app.handle_gesture(evt.clone());
+                }
                 Err(TryRecvError::Empty)        => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
