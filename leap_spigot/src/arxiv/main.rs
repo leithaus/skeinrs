@@ -1,10 +1,9 @@
 //! leap_spigot — interactive entry point.
 
 use leap_spigot::app::{AppConfig, run};
-use leap_spigot::visualizer::LayoutMode;
 use dual_spigot::SpigotConfig;
 use spigot_stream::Constant;
-use spigot_midi::{PitchMap, DurationMap, Scale};
+use spigot_midi::{PitchMap, DurationMap};
 use std::io::{self, Write};
 
 fn main() {
@@ -18,23 +17,9 @@ fn main() {
     println!("  Mode: LeapMotion hardware");
     #[cfg(not(feature = "leap"))]
     println!("  Mode: Keyboard simulation  (use --features leap for hardware)");
+    println!();
 
-    let args: Vec<String> = std::env::args().collect();
-
-    // Parse --layout flat|2d|3d
-    let layout = args.windows(2)
-        .find(|w| w[0] == "--layout")
-        .map(|w| LayoutMode::from_str(&w[1]))
-        .unwrap_or(LayoutMode::Flat);
-
-    let layout_name = match layout {
-        LayoutMode::Flat   => "flat (horizontal ribbons)",
-        LayoutMode::TwoD   => "2d  (vertical ribbons from bottom)",
-        LayoutMode::ThreeD => "3d  (perspective + hand ghosts)",
-    };
-    println!("  Layout: {}  (change with --layout flat|2d|3d)\n", layout_name);
-
-    let cfg = if args.iter().any(|a| a == "--quick") {
+    let cfg = if std::env::args().any(|a| a == "--quick") {
         println!("  Quick-start: π/e, C major, piano, 120 BPM\n");
         AppConfig::default()
     } else {
@@ -45,17 +30,7 @@ fn main() {
     println!("  Opening visualizer window…");
     println!();
 
-    if let Err(e) = if args.iter().any(|a| a == "--ipc") {
-        let sock = args.windows(2)
-            .find(|w| w[0] == "--sock")
-            .map(|w| w[1].as_str())
-            .unwrap_or(leap_spigot::ipc::DEFAULT_SOCK);
-        println!("  IPC mode — socket: {}", sock);
-        println!("  Start the visionOS app to connect.\n");
-        leap_spigot::app::run_ipc(cfg, sock)
-    } else {
-        run(cfg, layout)
-    } {
+    if let Err(e) = run(cfg) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }

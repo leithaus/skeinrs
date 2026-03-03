@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "spigot_stream",
+    "dual_spigot",
+    "spigot_midi",
+    "leap_spigot",
+]
+resolver = "2"

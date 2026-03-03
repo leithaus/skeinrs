@@ -13,9 +13,8 @@ use spigot_midi::{PitchMap, DurationMap, GeneralMidi};
 
 use crate::gesture::{GestureEvent, SimInput, SimGestureSource, spawn_gesture_source};
 use crate::ribbon::{RibbonState, StitchPhase, SnippetTray, ScissorAnimation, Patch};
-use crate::player::{Player, NoteEvent};
+use crate::player::Player;
 use crate::visualizer::{Visualizer, WIN_W};
-use crate::ipc::{IpcStateSender, StateMsg};
 
 // ════════════════════════════════════════════════════════════════════════════
 // AppConfig
@@ -76,7 +75,7 @@ pub struct AppState {
     // ── snippet ───────────────────────────────────────────────────────────
     tray:         SnippetTray,
     scissor_anim: Option<ScissorAnimation>,
-    snip_start:   usize,
+    snip_start:   usize,   // left-ribbon patch index where snip begins
 
     // ── note highlight ────────────────────────────────────────────────────
     note_highlight: Option<usize>,
@@ -85,15 +84,13 @@ pub struct AppState {
     pub status:   String,
 
     // ── snippet name input ────────────────────────────────────────────────
+    /// True while waiting for the user to type a snippet name.
     awaiting_snippet_name: bool,
     snippet_name_buf:      String,
 
     // ── instrument / tempo ───────────────────────────────────────────────
     instrument: u8,
     tempo_bpm:  u32,
-
-    // ── IPC bridge (None in keyboard-sim mode) ────────────────────────────
-    pub ipc_sender: Option<IpcStateSender>,
 }
 
 impl AppState {
@@ -143,7 +140,6 @@ impl AppState {
             snippet_name_buf:      String::new(),
             instrument: cfg.instrument,
             tempo_bpm:  cfg.tempo_bpm,
-            ipc_sender: None,
         }
     }
 
@@ -164,7 +160,6 @@ impl AppState {
                     "Pull LEFT ×{}  (vel={:.2})  pos={}",
                     steps, velocity, self.dual.left_pos()
                 );
-                self.ipc_send_digits();
             }
 
             // ── Pull Right ────────────────────────────────────────────────
@@ -180,13 +175,13 @@ impl AppState {
                     "Pull RIGHT ×{}  (vel={:.2})  pos={}",
                     steps, velocity, self.dual.right_pos()
                 );
-                self.ipc_send_digits();
             }
 
             // ── Twist ─────────────────────────────────────────────────────
             GestureEvent::Twist => {
                 self.dual.twist();
                 std::mem::swap(&mut self.left_ribbon, &mut self.right_ribbon);
+                // Update labels
                 let ll = format!("{} base {}", self.dual.left_constant().name(),
                                               self.dual.left_base());
                 let rl = format!("{} base {}", self.dual.right_constant().name(),
@@ -194,12 +189,6 @@ impl AppState {
                 self.left_ribbon.label  = ll.clone();
                 self.right_ribbon.label = rl.clone();
                 self.status = format!("TWIST — Left now: {}  Right now: {}", ll, rl);
-                if let Some(ref s) = self.ipc_sender {
-                    s.send(StateMsg::TwistAck {
-                        left_label:  ll,
-                        right_label: rl,
-                    });
-                }
             }
 
             // ── Clap → begin MIDI ─────────────────────────────────────────
@@ -209,7 +198,6 @@ impl AppState {
                     self.stitch = StitchPhase::Stitching { progress: 0.0 };
                     self.player.play();
                     self.status = "CLAP — MIDI playback started ♪".to_string();
-                    self.ipc_send_status();
                 }
             }
 
@@ -220,7 +208,6 @@ impl AppState {
                     self.stitch = StitchPhase::Unstitching { progress: 0.0 };
                     self.player.stop();
                     self.status = "UN-CLAP — MIDI playback stopped".to_string();
-                    self.ipc_send_status();
                 }
             }
 
@@ -235,80 +222,56 @@ impl AppState {
 
     /// Perform a snip: snapshot `from..to` absolute positions.
     pub fn do_snip(&mut self, name: &str) {
-        let from  = self.dual.left_pos().saturating_sub(self.left_ribbon.patches.len());
-        let to    = self.dual.left_pos();
+        // Snip from left_pos to left_pos + visible_patches
+        let from = self.dual.left_pos().saturating_sub(self.left_ribbon.patches.len());
+        let to   = self.dual.left_pos();
         let count = to - from;
 
         self.dual.snip(name, from, to);
 
+        // Collect patch pairs for the tray
         let pairs: Vec<(Patch, Patch)> = self.left_ribbon.patches.iter()
             .zip(self.right_ribbon.patches.iter())
             .map(|(l, r)| (l.clone(), r.clone()))
             .collect();
 
         self.tray.deposit(name, pairs);
+
+        // Trigger scissor animation
         self.scissor_anim = Some(ScissorAnimation::new(0, count.min(self.left_ribbon.capacity)));
         self.status = format!("SNIP \"{}\" — {} pairs [{}, {}) saved to tray", name, count, from, to);
-
-        if let Some(ref s) = self.ipc_sender {
-            s.send(StateMsg::SnipAck { name: name.to_string(), count });
-            s.send(StateMsg::Status(self.status.clone()));
-        }
     }
 
     // ── Per-frame tick ────────────────────────────────────────────────────
 
     pub fn tick(&mut self) {
+        // Animate ribbons
         self.left_ribbon.tick(48.0);
         self.right_ribbon.tick(48.0);
+
+        // Advance stitch animation
         self.stitch.tick();
 
+        // Advance scissor animation
         if let Some(ref mut sc) = self.scissor_anim {
             sc.tick();
             if sc.done() { self.scissor_anim = None; }
         }
 
+        // Tray animations
         self.tray.tick();
 
         // Drain note events from the player
         let notes = self.player.drain_notes();
         if let Some(last) = notes.last() {
+            // Find the ribbon patch closest to the left_pos
             self.note_highlight = self.left_ribbon.patches.iter().position(|p| {
                 p.position + 1 >= last.left_pos
             });
             self.status = format!(
-                "♪ pitch={}  duration={}t  L-pos={}  R-pos={}",
+                "♪ pitch={} duration={}t  L-pos={}  R-pos={}",
                 last.pitch, last.duration, last.left_pos, last.right_pos
             );
-            // Push note event to Swift UI for spatial audio / highlight
-            if let Some(ref s) = self.ipc_sender {
-                s.send(StateMsg::Note {
-                    pitch:     last.pitch,
-                    duration:  last.duration,
-                    velocity:  last.velocity,
-                    left_pos:  last.left_pos,
-                    right_pos: last.right_pos,
-                });
-            }
-        }
-    }
-
-    // ── IPC helpers ───────────────────────────────────────────────────────
-
-    fn ipc_send_digits(&self) {
-        if let Some(ref s) = self.ipc_sender {
-            s.send(StateMsg::Digits {
-                left:      self.left_ribbon.patches.iter().map(|p| p.digit).collect(),
-                right:     self.right_ribbon.patches.iter().map(|p| p.digit).collect(),
-                left_pos:  self.dual.left_pos(),
-                right_pos: self.dual.right_pos(),
-            });
-        }
-    }
-
-    fn ipc_send_status(&self) {
-        if let Some(ref s) = self.ipc_sender {
-            s.send(StateMsg::Status(self.status.clone()));
         }
     }
 
@@ -332,13 +295,13 @@ impl AppState {
 /// This is the entry point called from `main.rs`.  It creates the visualizer,
 /// the gesture source (simulation by default, hardware with `--feature leap`),
 /// and drives the event/render loop at ~60 fps.
-pub fn run(cfg: AppConfig, layout: crate::visualizer::LayoutMode) -> Result<(), String> {
+pub fn run(cfg: AppConfig) -> Result<(), String> {
     // ── Sim gesture channel ───────────────────────────────────────────────
     let (sim_tx, sim_rx) = mpsc::channel::<SimInput>();
     let gesture_rx = spawn_gesture_source(SimGestureSource { rx: sim_rx });
 
     // ── Visualizer (owns the window and the sim input sender) ────────────
-    let mut vis = Visualizer::new(sim_tx, layout)?;
+    let mut vis = Visualizer::new(sim_tx)?;
 
     // ── App state ─────────────────────────────────────────────────────────
     let mut app = AppState::new(cfg);
@@ -358,6 +321,7 @@ pub fn run(cfg: AppConfig, layout: crate::visualizer::LayoutMode) -> Result<(), 
             match gesture_rx.try_recv() {
                 Ok(GestureEvent::Quit) => return Ok(()),
                 Ok(GestureEvent::Scissors { name }) => {
+                    // Name already collected (hw mode) or we need to prompt (sim mode)
                     let n = if name.is_empty() {
                         print!("  Snippet name: ");
                         io::stdout().flush().ok();
@@ -367,22 +331,9 @@ pub fn run(cfg: AppConfig, layout: crate::visualizer::LayoutMode) -> Result<(), 
                     } else {
                         name
                     };
-                    vis.notify_gesture(crate::visualizer::HandGesture::Scissors);
                     app.handle_gesture(GestureEvent::Scissors { name: n });
                 }
-                Ok(ref evt) => {
-                    // Map gesture to hand pose for 3D ghost
-                    let hg = match evt {
-                        GestureEvent::PullLeft  { .. } => crate::visualizer::HandGesture::PullLeft,
-                        GestureEvent::PullRight { .. } => crate::visualizer::HandGesture::PullRight,
-                        GestureEvent::Twist            => crate::visualizer::HandGesture::Twist,
-                        GestureEvent::Clap             => crate::visualizer::HandGesture::Clap,
-                        GestureEvent::Unclap           => crate::visualizer::HandGesture::Idle,
-                        _                              => crate::visualizer::HandGesture::Idle,
-                    };
-                    vis.notify_gesture(hg);
-                    app.handle_gesture(evt.clone());
-                }
+                Ok(evt) => app.handle_gesture(evt),
                 Err(TryRecvError::Empty)        => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -408,72 +359,8 @@ pub fn run(cfg: AppConfig, layout: crate::visualizer::LayoutMode) -> Result<(), 
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// run_ipc() — headless mode driven by Unix socket
+// Tests
 // ════════════════════════════════════════════════════════════════════════════
-
-/// Run without a window, communicating over a Unix domain socket.
-///
-/// Called when `--ipc` is passed on the command line.
-/// The visionOS Swift app connects to the socket and drives all gestures;
-/// this process handles the spigot math, MIDI output, and state pushes.
-pub fn run_ipc(cfg: AppConfig, sock_path: &str) -> Result<(), String> {
-    use crate::ipc::{IpcGestureSource, spawn_ipc_server};
-    use std::time::{Duration, Instant};
-
-    eprintln!("[ipc] Starting headless IPC engine on {}", sock_path);
-
-    let source = IpcGestureSource::new(sock_path);
-    let (gesture_rx, state_sender) = spawn_ipc_server(source);
-
-    let mut app = AppState::new(cfg);
-    app.ipc_sender = Some(state_sender.clone());
-
-    // Send initial ribbon state to the client
-    app.ipc_send_digits();
-    state_sender.send(StateMsg::Status(app.status.clone()));
-
-    // Run at ~60 Hz without a window
-    let frame_dur = Duration::from_millis(16);
-    let mut last  = Instant::now();
-
-    loop {
-        // Drain gestures
-        loop {
-            match gesture_rx.try_recv() {
-                Ok(GestureEvent::Quit) => {
-                    eprintln!("[ipc] Quit received — shutting down");
-                    return Ok(());
-                }
-                Ok(GestureEvent::Scissors { name }) => {
-                    let n = if name.is_empty() {
-                        // In IPC mode the Swift app should always supply the name.
-                        // Fall back to a timestamp-based name if it doesn't.
-                        format!("snip_{}", last.elapsed().as_millis())
-                    } else { name };
-                    app.handle_gesture(GestureEvent::Scissors { name: n });
-                }
-                Ok(evt) => app.handle_gesture(evt),
-                Err(TryRecvError::Empty)        => break,
-                Err(TryRecvError::Disconnected) => {
-                    eprintln!("[ipc] Gesture channel closed — shutting down");
-                    return Ok(());
-                }
-            }
-        }
-
-        app.tick();
-
-        // Push status if changed
-        state_sender.send(StateMsg::Status(app.status.clone()));
-
-        // Sleep to maintain frame rate
-        let elapsed = last.elapsed();
-        if elapsed < frame_dur {
-            std::thread::sleep(frame_dur - elapsed);
-        }
-        last = Instant::now();
-    }
-}
 
 #[cfg(test)]
 mod tests {
