@@ -3,7 +3,6 @@
 [skein in one page](https://github.com/leithaus/skeinrs/blob/main/SkeinInOnePage.jpg)
 
 ```
-cd leap_spigot
 cargo build
 ```
 
@@ -26,3 +25,10 @@ to configure everything interactively first:
 bashcargo run
 It will ask you to pick constants, bases, scale, instrument, tempo, then open the visualizer window.
 
+For the Apple Vision Pro
+
+```
+xed LeapSpigotVision
+```
+
+Then, if you have an AVP, build with vision_pro as the destination. Otherwise, build with simulator as the destination.
